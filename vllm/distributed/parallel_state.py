@@ -1151,6 +1151,22 @@ def get_tensor_model_parallel_rank():
     return get_tp_group().rank_in_group
 
 
+def get_assigned_range(num_elements: int, tp_chunk: int = 1):
+    assert num_elements % tp_chunk == 0, 'Chunk size must divide the elements.'
+    num_elements = num_elements // tp_chunk
+
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_world_size = get_tp_group().world_size
+    base_elements_per_rank = num_elements // tp_world_size
+    extra_elements = num_elements % tp_world_size
+    # Ranks < extra_elements get one extra element
+    elements_per_rank = base_elements_per_rank + (1 if tp_rank < extra_elements else 0)
+    start = (tp_rank * base_elements_per_rank + min(tp_rank, extra_elements))
+    end = start + elements_per_rank
+    assert tp_rank < tp_world_size - 1 or end == num_elements
+    return tp_chunk * start, tp_chunk * end
+
+
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _TP

@@ -2,6 +2,7 @@
 
 import itertools
 from abc import abstractmethod
+from math import lcm
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -10,6 +11,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
+                              get_assigned_range,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce)
@@ -82,6 +84,16 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
         loaded_weight = loaded_weight[0]
 
     return param[shard_id], loaded_weight
+
+
+def partition_size(total_size: int, tp_chunk: int):
+    """Computes the partition size for the current rank.
+    Args:
+        total_size: This is the full size of the data being partitioned.
+        tp_chunk: The splitting is done in multiples of this parameter.
+    """
+    chunk_start, chunk_end = get_assigned_range(divide(total_size, tp_chunk))
+    return (chunk_end - chunk_start) * tp_chunk
 
 
 class LinearMethodBase(QuantizeMethodBase):
@@ -277,7 +289,8 @@ class ColumnParallelLinear(LinearBase):
         output_sizes: list of output sizes packed into one output, like for QKV
                        the list would be size 3.
         prefix: The name of the layer in the state dict, including all parents
-                        (e.g. model.layers.0.qkv_proj) 
+                        (e.g. model.layers.0.qkv_proj)
+        tp_chunk: Tensor parallel chunk size for splitting weights and inputs across devices.
     """
 
     def __init__(self,
@@ -289,23 +302,28 @@ class ColumnParallelLinear(LinearBase):
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
                  output_sizes: Optional[List[int]] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 tp_chunk: int = 1):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config, prefix)
 
         self.gather_output = gather_output
 
         # Divide the weight matrix along the last dimension.
-        tp_size = get_tensor_model_parallel_world_size()
         assert self.quant_method is not None
-        self.output_size_per_partition = divide(self.output_size, tp_size)
+        self.tp_chunk = lcm(tp_chunk, self.quant_method.tp_chunk(0))
+
+        self.output_size_per_partition = partition_size(self.output_size, self.tp_chunk)
         self.output_partition_sizes = [self.output_size_per_partition]
         # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
+            min_size = min(self.output_sizes)
+            factors = [divide(size, min_size) for size in self.output_sizes]
             self.output_partition_sizes = [
-                divide(output_size, tp_size)
-                for output_size in self.output_sizes
+                partition_size(output_size, self.tp_chunk * factor)
+                for output_size, factor in zip(self.output_sizes, factors)
             ]
+            self.output_partition_factors = factors
 
         if output_sizes is None:
             output_sizes = [output_size]
@@ -319,7 +337,8 @@ class ColumnParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2 if self.quant_method.__class__.__name__
-                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader),
+            tp_chunk=tp_chunk)
         if bias:
             self.bias = Parameter(
                 torch.empty(self.output_size_per_partition,
@@ -331,8 +350,10 @@ class ColumnParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
+    def column_tp_chunk(self) -> int:
+        return self.tp_chunk
+
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
         output_dim = getattr(param, "output_dim", None)
 
         # Special case for GGUF
@@ -353,10 +374,11 @@ class ColumnParallelLinear(LinearBase):
 
         param_data = param.data
         if output_dim is not None and not is_sharded_weight:
+            start_idx, end_idx = get_assigned_range(
+                loaded_weight.shape[output_dim], self.tp_chunk)
             shard_size = param_data.shape[output_dim]
-            start_idx = tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(output_dim, start_idx,
-                                                 shard_size)
+                                                 end_idx - start_idx)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -372,7 +394,22 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-        param.load_column_parallel_weight(loaded_weight=loaded_weight)
+
+        tp_chunk = self.tp_chunk
+        if isinstance(param, BlockQuantScaleParameter):
+            from vllm.model_executor.layers.quantization.fp8 import (
+                Fp8LinearMethod, Fp8MoEMethod)
+            assert self.quant_method is not None
+            assert isinstance(self.quant_method,
+                              (Fp8LinearMethod, Fp8MoEMethod))
+            weight_block_size = self.quant_method.quant_config.weight_block_size
+            assert weight_block_size is not None
+            block_n, _ = weight_block_size[0], weight_block_size[1]
+            if tp_chunk % block_n != 0:
+                breakpoint()
+            tp_chunk = divide(tp_chunk, block_n)
+
+        param.load_column_parallel_weight(loaded_weight=loaded_weight, tp_chunk=tp_chunk)
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
@@ -430,8 +467,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                  quant_config: Optional[QuantizationConfig] = None,
                  prefix: str = ""):
         self.output_sizes = output_sizes
-        tp_size = get_tensor_model_parallel_world_size()
-        assert all(output_size % tp_size == 0 for output_size in output_sizes)
         super().__init__(input_size=input_size,
                          output_size=sum(output_sizes),
                          bias=bias,
@@ -440,6 +475,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                          params_dtype=params_dtype,
                          quant_config=quant_config,
                          prefix=prefix)
+        assert all(output_size % self.tp_chunk == 0 for output_size in output_sizes)
 
     def weight_loader(self,
                       param: Parameter,
@@ -462,16 +498,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             return
 
         if is_gguf_weight:
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-
             output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // tp_size
-            start_idx = tp_rank * shard_size
+            start_idx, end_idx = get_assigned_range(loaded_weight.size(output_dim), self.tp_chunk)
 
             if loaded_shard_id is not None:
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx,
-                                                     shard_size)
+                                                     end_idx - start_idx)
                 param.shard_id.append(loaded_shard_id)
                 param.shard_id_map[loaded_shard_id] = len(param.data_container)
                 param.data_container.append(loaded_weight)
@@ -535,6 +567,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         if output_dim is not None:
+            raise NotImplementedError("Need to support chunk based sharding for this path.")
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
             shard_size = self.output_sizes[loaded_shard_id] // tp_size
             # Special case for quantization.
@@ -641,6 +674,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id < len(self.output_sizes)
 
         tp_size = get_tensor_model_parallel_world_size()
+        tp_chunk = self.tp_chunk
+        output_sizes = self.output_sizes
 
         if isinstance(param, BlockQuantScaleParameter):
             from vllm.model_executor.layers.quantization.fp8 import (
@@ -651,19 +686,26 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             assert weight_block_size is not None
             block_n, _ = weight_block_size[0], weight_block_size[1]
-            shard_offset = (
-                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) //
-                block_n) // tp_size
-            shard_size = ((self.output_sizes[loaded_shard_id] + block_n - 1) //
-                          block_n // tp_size)
-        else:
-            shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
-            shard_size = self.output_sizes[loaded_shard_id] // tp_size
+            tp_chunk = divide(tp_chunk, block_n)
+            output_sizes = [divide(size, block_n) for size in output_sizes]
+
+        shard_offset = 0
+        for factor, size in zip(
+                self.output_partition_factors[:loaded_shard_id],
+                output_sizes[:loaded_shard_id]):
+            shard_start, shard_end = get_assigned_range(
+            size, factor * tp_chunk)
+            shard_offset += shard_end - shard_start
+        tp_chunk *= self.output_partition_factors[loaded_shard_id]
+        size_start, size_end = get_assigned_range(
+            output_sizes[loaded_shard_id], tp_chunk)
+        shard_size = size_end - size_start
 
         param.load_merged_column_weight(loaded_weight=loaded_weight,
                                         shard_id=loaded_shard_id,
                                         shard_offset=shard_offset,
-                                        shard_size=shard_size)
+                                        shard_size=shard_size,
+                                        tp_chunk=tp_chunk)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -1038,7 +1080,8 @@ class RowParallelLinear(LinearBase):
                  params_dtype: Optional[torch.dtype] = None,
                  reduce_results: bool = True,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 tp_chunk: int = 1):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config, prefix)
 
@@ -1048,8 +1091,10 @@ class RowParallelLinear(LinearBase):
         # Divide the weight matrix along the last dimension.
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
+        self.tp_chunk = lcm(tp_chunk, self.quant_method.tp_chunk(1))
+        start_idx, end_idx = get_assigned_range(input_size, self.tp_chunk)
+        self.input_size_per_partition = end_idx - start_idx
 
         self.quant_method.create_weights(
             layer=self,
@@ -1060,7 +1105,8 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2 if self.quant_method.__class__.__name__
-                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader),
+            tp_chunk=tp_chunk)
         if not reduce_results and (bias and not skip_bias_add):
             raise ValueError("When not reduce the results, adding bias to the "
                              "results can lead to incorrect results")
@@ -1101,9 +1147,9 @@ class RowParallelLinear(LinearBase):
         param_data = param.data
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
-            start_idx = tp_rank * shard_size
+            start_idx, end_idx = get_assigned_range(loaded_weight.shape[input_dim], self.tp_chunk)
             loaded_weight = loaded_weight.narrow(input_dim, start_idx,
-                                                 shard_size)
+                                                 end_idx - start_idx)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -1122,7 +1168,20 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        param.load_row_parallel_weight(loaded_weight=loaded_weight)
+        tp_chunk = self.tp_chunk
+        if isinstance(param, BlockQuantScaleParameter):
+            from vllm.model_executor.layers.quantization.fp8 import (
+                Fp8LinearMethod, Fp8MoEMethod)
+            assert self.quant_method is not None
+            assert isinstance(self.quant_method,
+                              (Fp8LinearMethod, Fp8MoEMethod))
+            weight_block_size = self.quant_method.quant_config.weight_block_size
+            assert weight_block_size is not None
+            _, block_k = weight_block_size[0], weight_block_size[1]
+            tp_chunk = divide(tp_chunk, block_k)
+
+        param.load_row_parallel_weight(loaded_weight=loaded_weight,
+                                       tp_chunk=tp_chunk)
 
     def forward(self, input_):
         if self.input_is_parallel:

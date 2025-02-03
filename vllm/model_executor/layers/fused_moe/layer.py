@@ -6,7 +6,8 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from vllm.distributed import (get_tensor_model_parallel_rank,
+from vllm.distributed import (get_assigned_range,
+                              get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.logger import init_logger
@@ -259,6 +260,7 @@ class FusedMoE(torch.nn.Module):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        tp_chunk: int = 1
     ):
         super().__init__()
 
@@ -267,10 +269,9 @@ class FusedMoE(torch.nn.Module):
 
         self.tp_size = (tp_size if tp_size is not None else
                         get_tensor_model_parallel_world_size())
+        self.tp_chunk = 1
         self.top_k = top_k
         self.num_experts = num_experts
-        assert intermediate_size % self.tp_size == 0
-        self.intermediate_size_per_partition = intermediate_size // self.tp_size
         self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
@@ -291,8 +292,13 @@ class FusedMoE(torch.nn.Module):
                 UnquantizedFusedMoEMethod())
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
+            assert self.quant_method.tp_chunk(0) == self.quant_method.tp_chunk(1)
+            self.tp_chunk = self.quant_method.tp_chunk(0)
         assert self.quant_method is not None
 
+        start_idx, end_idx = get_assigned_range(intermediate_size, self.tp_chunk)
+        self.intermediate_start = start_idx
+        self.intermediate_size_per_partition = end_idx - start_idx
         moe_quant_params = {
             "num_experts": num_experts,
             "hidden_size": hidden_size,
@@ -328,7 +334,7 @@ class FusedMoE(torch.nn.Module):
                                                  expert_data: torch.Tensor,
                                                  shard_id: str,
                                                  loaded_weight: torch.Tensor,
-                                                 tp_rank: int,
+                                                 tp_start: int,
                                                  load_full_w2: bool = False):
         """
         Load grouped weight scales for group quantization or model weights
@@ -336,7 +342,7 @@ class FusedMoE(torch.nn.Module):
             :param expert_data: parameter for a particular expert
             :param shard_id: either w1, w2, or w3
             :param loaded_weight: checkpoint weight to load into the param
-            :param tp_rank: tensor parallel rank
+            :param tp_start: tensor parallel slice start
             :param load_full_w2: whether or not the w2 loaded should be sharded.
         """
         if shard_id == "w2":
@@ -345,19 +351,19 @@ class FusedMoE(torch.nn.Module):
             self._load_w2(shard_dim=shard_dim,
                           loaded_weight=loaded_weight,
                           expert_data=expert_data,
-                          tp_rank=tp_rank,
+                          tp_start=tp_start,
                           load_full=load_full_w2)
         elif shard_id in ("w1", "w3"):
             self._load_w13(shard_id=shard_id,
                            shard_dim=shard_dim,
                            loaded_weight=loaded_weight,
                            expert_data=expert_data,
-                           tp_rank=tp_rank)
+                           tp_start=tp_start)
 
     def _load_per_channel_weight_scale(self, expert_data: torch.Tensor,
                                        shard_dim: int, shard_id: str,
                                        loaded_weight: torch.Tensor,
-                                       tp_rank: int):
+                                       tp_start: int):
         # for per channel weight quantization
         if shard_id == "w2":
             expert_data.copy_(loaded_weight)
@@ -366,16 +372,15 @@ class FusedMoE(torch.nn.Module):
                            shard_dim=shard_dim,
                            loaded_weight=loaded_weight,
                            expert_data=expert_data,
-                           tp_rank=tp_rank)
+                           tp_start=tp_start)
 
     def _load_w13(self, expert_data: torch.Tensor, shard_dim: int,
-                  shard_id: str, loaded_weight: torch.Tensor, tp_rank: int):
+                  shard_id: str, loaded_weight: torch.Tensor, tp_start: int):
 
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
-        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank,
-                                             shard_size)
+        loaded_weight = loaded_weight.narrow(shard_dim, tp_start, shard_size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -390,7 +395,7 @@ class FusedMoE(torch.nn.Module):
                  expert_data: torch.Tensor,
                  shard_dim: int,
                  loaded_weight: torch.Tensor,
-                 tp_rank: int,
+                 tp_start: int,
                  load_full: bool = False):
 
         # Index the loaded weight for tp sharding.
@@ -399,7 +404,7 @@ class FusedMoE(torch.nn.Module):
         shard_size = expert_data.shape[shard_dim]
         if not load_full:
             loaded_weight = loaded_weight.narrow(shard_dim,
-                                                 shard_size * tp_rank,
+                                                 tp_start,
                                                  shard_size)
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
@@ -412,13 +417,13 @@ class FusedMoE(torch.nn.Module):
         param_data[expert_id] = loaded_weight
 
     def _load_g_idx(self, shard_id: str, expert_data: torch.Tensor,
-                    shard_dim: int, loaded_weight: torch.Tensor, tp_rank: int):
+                    shard_dim: int, loaded_weight: torch.Tensor, tp_start: int):
 
         if shard_id == "w2":
             self._load_w2(shard_dim=shard_dim,
                           loaded_weight=loaded_weight,
                           expert_data=expert_data,
-                          tp_rank=tp_rank)
+                          tp_start=tp_start)
         else:
             assert shard_id in ("w1", "w3")
             expert_data.copy_(loaded_weight)
@@ -480,7 +485,7 @@ class FusedMoE(torch.nn.Module):
                              shard_id=shard_id,
                              loaded_weight=loaded_weight,
                              expert_data=expert_data,
-                             tp_rank=tp_rank)
+                             tp_start=self.intermediate_start)
             return
 
         # Case weight scales and zero_points
@@ -497,7 +502,7 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank)
+                    tp_start=self.intermediate_start)
             elif quant_method in [
                     FusedMoeWeightScaleSupported.GROUP.value,
                     FusedMoeWeightScaleSupported.BLOCK.value,
@@ -507,7 +512,7 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
+                    tp_start=self.intermediate_start // self.tp_chunk,
                     load_full_w2=getattr(param, "load_full_w2", False))
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 self._load_per_tensor_weight_scale(shard_id=shard_id,
@@ -534,7 +539,7 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank)
+                tp_start=self.intermediate_start)
             return
 
     @staticmethod
