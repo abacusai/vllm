@@ -41,6 +41,10 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def tp_chunk(self, dim=None) -> int:
+        """Returns the tensor parallel chunk size along the specified dimension."""
+        return 256  # Reasonable default.
+
 
 def method_has_implemented_embedding(
         method_class: Type[QuantizeMethodBase]) -> bool:

@@ -6,7 +6,7 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import get_assigned_range
 from vllm.logger import init_logger
 from vllm.model_executor.utils import _make_synced_weight_loader
 
@@ -100,15 +100,14 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     def output_dim(self):
         return self._output_dim
 
-    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
-        shard_size = self.data.shape[self.output_dim]
+    def load_column_parallel_weight(self, loaded_weight: torch.Tensor, tp_chunk: int = 1):
+        start_idx, end_idx = get_assigned_range(loaded_weight.shape[self.output_dim], tp_chunk)
         loaded_weight = loaded_weight.narrow(self.output_dim,
-                                             tp_rank * shard_size, shard_size)
+                                             start_idx, end_idx - start_idx)
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
-    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+    def load_merged_column_weight(self, loaded_weight: torch.Tensor, tp_chunk: int = 1, **kwargs):
 
         shard_offset = kwargs.get("shard_offset")
         shard_size = kwargs.get("shard_size")
@@ -121,15 +120,15 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = self.data
 
-        tp_rank = get_tensor_model_parallel_rank()
+        start_idx, end_idx = get_assigned_range(loaded_weight.shape[self.output_dim], tp_chunk)
         param_data = param_data.narrow(self.output_dim, shard_offset,
                                        shard_size)
         loaded_weight = loaded_weight.narrow(self.output_dim,
-                                             tp_rank * shard_size, shard_size)
+                                             start_idx, end_idx - start_idx)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-    def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
+    def load_qkv_weight(self, loaded_weight: torch.Tensor, tp_chunk: int = 1, **kwargs):
 
         shard_offset = kwargs.get("shard_offset")
         shard_size = kwargs.get("shard_size")
@@ -144,6 +143,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 shard_offset=shard_offset, shard_size=shard_size)
 
         param_data = self.data
+        assert tp_chunk == 1   # This needs to be fixed.
         tp_rank = get_tensor_model_parallel_rank()
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset,
@@ -171,13 +171,13 @@ class RowvLLMParameter(BasevLLMParameter):
     def input_dim(self):
         return self._input_dim
 
-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
+    def load_row_parallel_weight(self, loaded_weight: torch.Tensor, tp_chunk: int = 1):
+        start_idx, end_idx = get_assigned_range(loaded_weight.shape[self.input_dim], tp_chunk)
         shard_size = self.data.shape[self.input_dim]
         loaded_weight = loaded_weight.narrow(self.input_dim,
-                                             tp_rank * shard_size, shard_size)
+                                             start_idx, end_idx - start_idx)
 
-        if len(loaded_weight.shape) == 0:
+        if len(loaded_weight.shape) == 0:  # How can this every be hit? The narrow op would fail.
             loaded_weight = loaded_weight.reshape(1)
 
         assert self.data.shape == loaded_weight.shape

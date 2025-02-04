@@ -706,11 +706,6 @@ class ModelConfig:
         total_num_attention_heads = getattr(self.hf_text_config,
                                             "num_attention_heads", 0)
         tensor_parallel_size = parallel_config.tensor_parallel_size
-        if total_num_attention_heads % tensor_parallel_size != 0:
-            raise ValueError(
-                f"Total number of attention heads ({total_num_attention_heads})"
-                " must be divisible by tensor parallel size "
-                f"({tensor_parallel_size}).")
 
         pipeline_parallel_size = parallel_config.pipeline_parallel_size
         if pipeline_parallel_size > 1:
@@ -839,13 +834,15 @@ class ModelConfig:
         # the tensor parallel size. We will replicate the KV heads in the
         # case where the number of KV heads is smaller than the tensor
         # parallel size so each GPU has at least one KV head.
-        return max(1,
-                   total_num_kv_heads // parallel_config.tensor_parallel_size)
+        return max(1, (total_num_kv_heads
+                       + parallel_config.tensor_parallel_size - 1) //
+                       parallel_config.tensor_parallel_size)
 
     def get_num_attention_heads(self,
                                 parallel_config: "ParallelConfig") -> int:
         num_heads = getattr(self.hf_text_config, "num_attention_heads", 0)
-        return num_heads // parallel_config.tensor_parallel_size
+        return ((num_heads + parallel_config.tensor_parallel_size - 1) //
+                parallel_config.tensor_parallel_size)
 
     def get_layers_start_end_indices(
             self, parallel_config: "ParallelConfig") -> Tuple[int, int]:

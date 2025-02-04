@@ -6,6 +6,7 @@ import torch
 
 from vllm.attention import get_attn_backend
 from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig
+from vllm.distributed import get_assigned_range, get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
@@ -37,7 +38,6 @@ class CacheEngine:
         # Models like Jamba, have mixed typed layers, E.g Mamba
         self.num_attention_layers = model_config.get_num_layers_by_block_type(
             parallel_config, LayerBlockType.attention)
-        self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
 
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
@@ -71,8 +71,10 @@ class CacheEngine:
         device: str,
     ) -> List[torch.Tensor]:
         """Allocates KV cache on the specified device."""
+        total_num_kv_heads = self.model_config.get_total_num_kv_heads()
+        start_idx, end_idx = get_assigned_range(total_num_kv_heads, 2)
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-            num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+            num_blocks, self.block_size, end_idx - start_idx, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         kv_cache: List[torch.Tensor] = []
         for _ in range(self.num_attention_layers):

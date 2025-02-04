@@ -150,7 +150,14 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             # Marlin doesn't support block-wise fp8
             self.use_marlin = False
-
+    
+    def tp_chunk(self, dim=None) -> int:
+        if self.block_quant:
+            if dim is None:
+                return max(*self.quant_config.weight_block_size)  # Should actually be LCM.
+            return self.quant_config.weight_block_size[dim]
+        return super.tp_chunk(dim)
+    
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -163,6 +170,7 @@ class Fp8LinearMethod(LinearMethodBase):
     ):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
+        tp_chunk = extra_weight_attrs.get("tp_chunk") or self.tp_chunk()
 
         if self.block_quant:
             tp_size = get_tensor_model_parallel_world_size()
@@ -173,15 +181,19 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             # Required by row parallel
             if (tp_size > 1
-                    and input_size // input_size_per_partition == tp_size
+                    and output_size_per_partition == output_size
+                    and input_size_per_partition != input_size
+                    # Not column sharded
                     and input_size_per_partition % block_k != 0):
                 raise ValueError(
                     f"Weight input_size_per_partition = "
                     f"{input_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}.")
             # Required by column parallel or enabling merged weights
-            if (tp_size > 1 and output_size // output_size_per_partition
-                    == tp_size) or len(output_partition_sizes) > 1:
+            if (tp_size > 1
+                    and input_size_per_partition == input_size  # Not row sharded
+                    and output_size_per_partition != output_size
+                    ) or len(output_partition_sizes) > 1:
                 for output_partition_size in output_partition_sizes:
                     if output_partition_size % block_n != 0:
                         raise ValueError(

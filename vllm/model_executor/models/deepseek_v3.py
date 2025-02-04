@@ -31,7 +31,8 @@ from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
-from vllm.distributed import (get_pp_group,
+from vllm.distributed import (get_assigned_range,
+                              get_pp_group,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -101,14 +102,15 @@ class DeepseekV3MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.routed_scaling_factor = config.routed_scaling_factor
-        if self.tp_size > config.n_routed_experts:
+        if tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.n_routed_experts}.")
+        self.needs_reduce = tp_size > 1
 
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
@@ -163,7 +165,7 @@ class DeepseekV3MoE(nn.Module):
             router_logits=router_logits) * self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
+        if self.needs_reduce:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
 
@@ -205,9 +207,8 @@ class DeepseekV3Attention(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
+        start_head, end_head = get_assigned_range(num_heads, 2)
+        self.num_local_heads = end_head - start_head
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -225,14 +226,16 @@ class DeepseekV3Attention(nn.Module):
                                                  self.qk_head_dim,
                                                  bias=False,
                                                  quant_config=quant_config,
-                                                 prefix=f"{prefix}.q_b_proj")
+                                                 prefix=f"{prefix}.q_b_proj",
+                                                 tp_chunk=(2 * self.qk_head_dim))
         else:
             self.q_proj = ColumnParallelLinear(self.hidden_size,
                                                self.num_heads *
                                                self.qk_head_dim,
                                                bias=False,
                                                quant_config=quant_config,
-                                               prefix=f"{prefix}.q_proj")
+                                               prefix=f"{prefix}.q_proj",
+                                               tp_chunk=(2*self.qk_head_dim))
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
             self.hidden_size,
@@ -247,13 +250,15 @@ class DeepseekV3Attention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj")
+            prefix=f"{prefix}.kv_b_proj",
+            tp_chunk=(2 * (self.qk_nope_head_dim + self.v_head_dim)))
         # O projection.
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
                                         quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
+                                        prefix=f"{prefix}.o_proj",
+                                        tp_chunk=(2*self.v_head_dim))
         if rope_scaling:
             rope_scaling["rope_type"] = 'deepseek_yarn'
             self.use_normal_rope = False
@@ -372,9 +377,8 @@ class DeepseekV3MLAAttention(nn.Module):
         self.kv_lora_rank = kv_lora_rank
 
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
+        start_head, end_head = get_assigned_range(num_heads, 2)
+        self.num_local_heads = end_head - start_head
 
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
@@ -393,14 +397,16 @@ class DeepseekV3MLAAttention(nn.Module):
                                                  self.qk_head_dim,
                                                  bias=False,
                                                  quant_config=quant_config,
-                                                 prefix=f"{prefix}.q_b_proj")
+                                                 prefix=f"{prefix}.q_b_proj",
+                                                 tp_chunk=(2 * self.qk_head_dim))
         else:
             self.q_proj = ColumnParallelLinear(self.hidden_size,
                                                self.num_heads *
                                                self.qk_head_dim,
                                                bias=False,
                                                quant_config=quant_config,
-                                               prefix=f"{prefix}.q_proj")
+                                               prefix=f"{prefix}.q_proj",
+                                               tp_chunk=(2*self.qk_head_dim))
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
             self.hidden_size,
@@ -415,12 +421,15 @@ class DeepseekV3MLAAttention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj")
+            prefix=f"{prefix}.kv_b_proj",
+            tp_chunk=(2 * (self.qk_nope_head_dim + self.v_head_dim)))
+        # O projection.
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
                                         quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
+                                        prefix=f"{prefix}.o_proj",
+                                        tp_chunk=(2*self.v_head_dim))
 
         rope_scaling["rope_type"] = 'deepseek_yarn'
         self.rotary_emb = get_rope(qk_rope_head_dim,
